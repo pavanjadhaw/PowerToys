@@ -134,10 +134,23 @@ jobs:
           Remove-Item $pfx
           Write-Host "Signing with $($cert.Thumbprint)"
 
+      - name: Stub the internal versioning package
+        shell: pwsh
+        run: |
+          # build-installer.ps1 fetches Microsoft.Windows.Terminal.Versioning from Microsoft's internal
+          # feed (401 here). It only sets the CmdPal/AdvancedPaste MSIX version, which then defaults
+          # to 0.0.1.0. A no-op Setup.ps1 where the script looks for it lets the build go on.
+          $d = Join-Path $env:LOCALAPPDATA 'PowerToys\BuildTools\.versioning\Microsoft.Windows.Terminal.Versioning\build'
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Set-Content (Join-Path $d 'Setup.ps1') 'param($ProjectDirectory) Write-Host "versioning stub: $ProjectDirectory"'
+
       - name: Build the per-user installer
         working-directory: src
         shell: pwsh
-        run: ./tools/build/build-installer.ps1 -Platform x64 -Configuration Release -PerUser true -Version $env:VERSION -Force
+        run: |
+          $ErrorActionPreference = 'Continue'
+          ./tools/build/build-installer.ps1 -Platform x64 -Configuration Release -PerUser true -Version $env:VERSION -Force
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Collect
         if: always()
@@ -148,6 +161,7 @@ jobs:
             Where-Object { $_.FullName -match '\\(x64)\\Release\\' } | Copy-Item -Destination $out
           $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -like 'CN=Microsoft Corporation*' | Select-Object -First 1
           if ($cert) { Export-Certificate -Cert $cert -FilePath (Join-Path $out 'PowerToys-fork-signing.cer') | Out-Null }
+          git -C src fetch -q --filter=blob:none --no-tags "https://github.com/$env:UPSTREAM.git" "+refs/tags/${env:TAG}:refs/tags/$env:TAG"
           git -C src log --oneline "$env:TAG..HEAD" | Set-Content (Join-Path $out 'commits.txt')
           Get-ChildItem $out | Format-Table Name, Length
           "OUT=$out" >> $env:GITHUB_ENV
