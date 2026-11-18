@@ -1,0 +1,178 @@
+# Builds the per-user x64 installer of this fork's feature branch, rebased onto the
+# latest upstream PowerToys release tag. Runs daily and on demand. Lives on the
+# orphan default branch `fork-ci` so upstream's own workflows never run here.
+name: Fork build
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Feature branch to build
+        default: grab-anywhere
+      force:
+        description: Build even if this branch + tag already has a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-build
+  cancel-in-progress: false
+
+env:
+  BRANCH: ${{ inputs.branch || 'grab-anywhere' }}
+  UPSTREAM: microsoft/PowerToys
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      tag: ${{ steps.plan.outputs.tag }}
+      head: ${{ steps.plan.outputs.head }}
+      behind: ${{ steps.plan.outputs.behind }}
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$BRANCH" --jq .sha)
+          owner=${GITHUB_REPOSITORY%%/*}
+          behind=$(gh api "repos/$UPSTREAM/compare/$tag...$owner:$head" --jq .behind_by)
+          release="build-$tag-${head:0:7}"
+          version="${tag#v}.$GITHUB_RUN_NUMBER"
+          build=true
+          if [ "$FORCE" != "true" ] && gh release view "$release" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+          fi
+          echo "latest upstream release $tag, $BRANCH at $head is $behind commits behind it; release $release; build=$build"
+          {
+            echo "tag=$tag"; echo "head=$head"; echo "behind=$behind"
+            echo "release=$release"; echo "version=$version"; echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 355
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      HEAD_SHA: ${{ needs.plan.outputs.head }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+    steps:
+      - name: Enable long paths
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.head }}
+          fetch-depth: 0
+          filter: blob:none
+          path: src
+
+      - name: Rebase onto ${{ needs.plan.outputs.tag }}
+        if: needs.plan.outputs.behind != '0'
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "fork-build"
+          git config user.email "fork-build@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --filter=blob:none --no-tags upstream '+refs/tags/v*:refs/tags/v*'
+          old=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)
+          echo "rebasing $(git rev-list --count "$old..HEAD") commits from $old onto $TAG"
+          git rebase --onto "$TAG" "$old"
+          git log --oneline "$TAG..HEAD"
+
+      - name: Push the rebased branch
+        if: needs.plan.outputs.behind != '0'
+        working-directory: src
+        shell: bash
+        env:
+          PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+        run: |
+          # GITHUB_TOKEN may not push history that touches upstream's workflow files, so this
+          # needs a token with the workflow scope. Without one the build still uses the rebase.
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::warning::FORK_PUSH_TOKEN not set; rebased $BRANCH was built but not pushed"
+            exit 0
+          fi
+          git push --force-with-lease="$BRANCH:$HEAD_SHA" \
+            "https://x-access-token:$PUSH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$BRANCH"
+
+      - name: Import the MSIX signing certificate
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        run: |
+          # The build signs its MSIX packages with the first "CN=Microsoft Corporation, ..." cert in
+          # CurrentUser\My and makes one if there is none. A fixed cert from secrets means installs
+          # only need its .cer trusted once.
+          if (-not $env:PFX_BASE64) { Write-Warning 'No SIGNING_PFX_BASE64 secret; the build makes a throwaway cert'; exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+          $pw = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+          $cer = Join-Path $env:RUNNER_TEMP 'signing.cer'
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          foreach ($store in 'Cert:\LocalMachine\Root', 'Cert:\LocalMachine\TrustedPeople', 'Cert:\CurrentUser\TrustedPeople') {
+            Import-Certificate -FilePath $cer -CertStoreLocation $store | Out-Null
+          }
+          Remove-Item $pfx
+          Write-Host "Signing with $($cert.Thumbprint)"
+
+      - name: Build the per-user installer
+        working-directory: src
+        shell: pwsh
+        run: ./tools/build/build-installer.ps1 -Platform x64 -Configuration Release -PerUser true -Version $env:VERSION -Force
+
+      - name: Collect
+        if: always()
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'out')
+          Get-ChildItem src/installer -Recurse -Include 'PowerToys*Setup*.exe', 'PowerToys*Setup*.msi' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\(x64)\\Release\\' } | Copy-Item -Destination $out
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -like 'CN=Microsoft Corporation*' | Select-Object -First 1
+          if ($cert) { Export-Certificate -Cert $cert -FilePath (Join-Path $out 'PowerToys-fork-signing.cer') | Out-Null }
+          git -C src log --oneline "$env:TAG..HEAD" | Set-Content (Join-Path $out 'commits.txt')
+          Get-ChildItem $out | Format-Table Name, Length
+          "OUT=$out" >> $env:GITHUB_ENV
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: src/artifacts/logs
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: PowerToysUserSetup-${{ needs.plan.outputs.version }}-x64
+          path: ${{ env.OUT }}
+          if-no-files-found: error
+
+      - name: Publish a release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The tag points at this fork-ci commit, so release events only see this branch's workflows.
+          notes="Per-user x64 build of \`$BRANCH\` (${HEAD_SHA:0:7}) on upstream $TAG, version $VERSION."
+          gh release delete "$RELEASE" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "PowerToys $VERSION ($BRANCH)" --notes "$notes" "$OUT"/*
