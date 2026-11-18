@@ -147,6 +147,36 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             }
         }
 
+        public bool NativeDrag
+        {
+            get => _moduleSettings.Properties.NativeDrag.Value;
+
+            set
+            {
+                if (_moduleSettings.Properties.NativeDrag.Value != value)
+                {
+                    _moduleSettings.Properties.NativeDrag.Value = value;
+                    NotifyModuleSettingsChanged();
+                    OnPropertyChanged(nameof(NativeDrag));
+                }
+            }
+        }
+
+        public bool SideButtons
+        {
+            get => _moduleSettings.Properties.SideButtons.Value;
+
+            set
+            {
+                if (_moduleSettings.Properties.SideButtons.Value != value)
+                {
+                    _moduleSettings.Properties.SideButtons.Value = value;
+                    NotifyModuleSettingsChanged();
+                    OnPropertyChanged(nameof(SideButtons));
+                }
+            }
+        }
+
         public bool DoNotActivateOnGameMode
         {
             get => _moduleSettings.Properties.DoNotActivateOnGameMode.Value;

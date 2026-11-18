@@ -17,7 +17,15 @@ namespace Microsoft.PowerToys.Settings.UI.Library
             ExcludedApps = new StringProperty();
             ExcludedAppsForModifier = new StringProperty();
             ModifierKey = new IntProperty(0); // 0 = Alt, 1 = Win
+            NativeDrag = new BoolProperty(false);
+            SideButtons = new BoolProperty(false);
         }
+
+        [JsonPropertyName("nativeDrag")]
+        public BoolProperty NativeDrag { get; set; }
+
+        [JsonPropertyName("sideButtons")]
+        public BoolProperty SideButtons { get; set; }
 
         [JsonPropertyName("modifierKey")]
         public IntProperty ModifierKey { get; set; }

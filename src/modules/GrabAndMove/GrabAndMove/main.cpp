@@ -102,6 +102,8 @@ struct SettingsSnapshot
     bool showGeometry = false;
     bool doNotActivateOnGameMode = true;
     bool useAltResize = true;
+    bool nativeDrag = false;
+    bool sideButtons = false;
     std::shared_ptr<const std::vector<std::wstring>> excludedApps =
         std::make_shared<const std::vector<std::wstring>>();
     std::shared_ptr<const std::vector<std::wstring>> modifierExcludedApps =
@@ -750,6 +752,16 @@ static bool TryLoadSettingsFromFile(const SettingsSnapshot& current, SettingsSna
         if (auto v = values.get_bool_value(L"useAltResize"))
         {
             updated.useAltResize = *v;
+        }
+
+        if (auto v = values.get_bool_value(L"nativeDrag"))
+        {
+            updated.nativeDrag = *v;
+        }
+
+        if (auto v = values.get_bool_value(L"sideButtons"))
+        {
+            updated.sideButtons = *v;
         }
 
         if (auto v = values.get_int_value(L"modifierKey"))
@@ -2659,6 +2671,353 @@ static constexpr InteractionAction ActionForButton(MouseButton button)
     return button == MouseButton::Right ? InteractionAction::Resize : InteractionAction::Move;
 }
 
+// ---------------------------------------------------------------------------
+// Native drag handoff and side-button chords.
+//
+// Native handoff: instead of moving the window itself, the module posts
+// WM_SYSCOMMAND so the target runs the system move/size loop, as if its frame
+// had been grabbed. Window managers such as FancyZones then get
+// EVENT_SYSTEM_MOVESIZESTART and work as usual (zones, spanning, layout
+// switching). SC_SIZE | 9 starts a move from any point in the window (unlike
+// SC_MOVE | HTCAPTION, it does not wait for drag detection, which fails because
+// the button-down was swallowed); SC_SIZE | WMSZ_* starts a resize from that
+// corner. Both loops end on the real button-up, which is passed through. If no
+// loop starts within NATIVE_START_TIMEOUT_MS, a move falls back to the module's
+// own move.
+//
+// Side buttons: holding back (XButton1) or forward (XButton2) turns the next
+// mouse input into a chord. A plain click is replayed on release.
+//   back + left-drag     move (native)      forward + left-drag   resize from the nearest corner
+//   back + wheel         previous/next virtual desktop
+//   forward + wheel      previous/next window in the FancyZones zone
+//   back + right-click   maximize / restore forward + right-click minimize
+// ---------------------------------------------------------------------------
+static constexpr UINT_PTR NATIVE_START_TIMER_ID = 0x474D;
+static constexpr UINT NATIVE_START_TIMEOUT_MS = 250;
+static constexpr WPARAM SC_MOVE_FROM_ANYWHERE = SC_SIZE | 9;
+static constexpr UINT WM_SIDE_ACTION = WM_APP + 2;
+static constexpr WORD UNASSIGNED_VK = 0xE8; // keeps a lone Alt/Win release from opening a menu or Start
+
+enum class SideButton
+{
+    None,
+    Back,
+    Forward,
+};
+
+enum class SideAction : WPARAM
+{
+    PreviousDesktop = 1,
+    NextDesktop,
+    PreviousZoneWindow,
+    NextZoneWindow,
+};
+
+struct NativeHandoffState
+{
+    HWND target = nullptr;
+    POINT startPoint{};
+    bool move = false;
+    bool waiting = false; // posted; EVENT_SYSTEM_MOVESIZESTART not seen yet
+    bool leftHeld = false; // its down was swallowed, so GetAsyncKeyState can't tell
+    bool sideTriggered = false;
+};
+
+struct SideButtonState
+{
+    SideButton held = SideButton::None;
+    WORD xbutton = 0;
+    bool chorded = false;
+    bool swallowRightUp = false;
+    int wheelRemainder = 0;
+};
+
+static NativeHandoffState g_native;
+static SideButtonState g_side;
+static HWINEVENTHOOK g_hMoveSizeEventHook = nullptr;
+
+static void CALLBACK MoveSizeEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG, DWORD, DWORD)
+{
+    if (event == EVENT_SYSTEM_MOVESIZESTART && idObject == OBJID_WINDOW && g_native.waiting && hwnd == g_native.target)
+    {
+        g_native.waiting = false;
+        KillTimer(g_hMsgWnd, NATIVE_START_TIMER_ID);
+    }
+}
+
+static bool StartNativeHandoff(HWND target, POINT point, bool move, bool sideTriggered)
+{
+    RECT rect{};
+    if (!target || !GetWindowRect(target, &rect) || (!move && IsZoomed(target)))
+    {
+        return false;
+    }
+
+    WPARAM command = SC_MOVE_FROM_ANYWHERE;
+    if (!move)
+    {
+        const bool left = point.x < (rect.left + rect.right) / 2;
+        const bool top = point.y < (rect.top + rect.bottom) / 2;
+        command = SC_SIZE | (top ? (left ? WMSZ_TOPLEFT : WMSZ_TOPRIGHT) : (left ? WMSZ_BOTTOMLEFT : WMSZ_BOTTOMRIGHT));
+    }
+
+    if (!PostMessageW(target, WM_SYSCOMMAND, command, MAKELPARAM(point.x, point.y)))
+    {
+        return false;
+    }
+
+    g_native = {};
+    g_native.target = target;
+    g_native.startPoint = point;
+    g_native.move = move;
+    g_native.waiting = true;
+    g_native.leftHeld = true;
+    g_native.sideTriggered = sideTriggered;
+    SetTimer(g_hMsgWnd, NATIVE_START_TIMER_ID, NATIVE_START_TIMEOUT_MS, nullptr);
+    return true;
+}
+
+static void OnNativeStartTimeout()
+{
+    KillTimer(g_hMsgWnd, NATIVE_START_TIMER_ID);
+    if (!g_native.waiting)
+    {
+        return;
+    }
+
+    const NativeHandoffState handoff = g_native;
+    g_native.waiting = false;
+    if (!handoff.move || !handoff.leftHeld || g_interaction.phase != InteractionPhase::Idle || !IsWindow(handoff.target))
+    {
+        return;
+    }
+
+    // The target ignored the move command: drag it ourselves from here on.
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const ModifierSession session = g_modifierSession;
+    if (BeginInteraction(InteractionAction::Move, MouseButton::Left, handoff.target, handoff.startPoint))
+    {
+        if (handoff.sideTriggered)
+        {
+            g_modifierSession = session;
+        }
+        HandleDragMove(cursor);
+    }
+}
+
+static constexpr bool IsExtendedVirtualKey(WORD vk)
+{
+    return (vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT || vk == VK_DELETE || vk == VK_LWIN || vk == VK_RWIN;
+}
+
+static void AppendKey(std::vector<INPUT>& inputs, WORD vk, bool up)
+{
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = vk;
+    input.ki.wScan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+    input.ki.dwFlags = (up ? KEYEVENTF_KEYUP : 0) | (IsExtendedVirtualKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
+    inputs.push_back(input);
+}
+
+static void SendShortcut(bool win, bool ctrl, bool alt, bool shift, WORD key)
+{
+    std::vector<WORD> modifiers;
+    if (win)
+    {
+        modifiers.push_back(VK_LWIN);
+    }
+    if (ctrl)
+    {
+        modifiers.push_back(VK_LCONTROL);
+    }
+    if (alt)
+    {
+        modifiers.push_back(VK_LMENU);
+    }
+    if (shift)
+    {
+        modifiers.push_back(VK_LSHIFT);
+    }
+
+    std::vector<INPUT> inputs;
+    for (const WORD modifier : modifiers)
+    {
+        AppendKey(inputs, modifier, false);
+    }
+    AppendKey(inputs, key, false);
+    AppendKey(inputs, key, true);
+    // A registered hotkey eats the key, so the target would see a lone modifier tap.
+    AppendKey(inputs, UNASSIGNED_VK, false);
+    AppendKey(inputs, UNASSIGNED_VK, true);
+    for (auto it = modifiers.rbegin(); it != modifiers.rend(); ++it)
+    {
+        AppendKey(inputs, *it, true);
+    }
+    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+}
+
+static void CycleZoneWindow(HWND target, bool next)
+{
+    // Press FancyZones' own "next/previous window in zone" hotkey (default Win+PgDn / Win+PgUp).
+    bool win = true, ctrl = false, alt = false, shift = false;
+    WORD key = next ? VK_NEXT : VK_PRIOR;
+    try
+    {
+        const auto values = PowerToysSettings::PowerToyValues::load_from_settings_file(L"FancyZones");
+        if (const auto enabled = values.get_bool_value(L"fancyzones_windowSwitching"); enabled && !*enabled)
+        {
+            return;
+        }
+        if (const auto json = values.get_json(next ? L"fancyzones_nextTab_hotkey" : L"fancyzones_prevTab_hotkey"))
+        {
+            const auto hotkey = PowerToysSettings::HotkeyObject::from_json(*json);
+            win = hotkey.win_pressed();
+            ctrl = hotkey.ctrl_pressed();
+            alt = hotkey.alt_pressed();
+            shift = hotkey.shift_pressed();
+            key = static_cast<WORD>(hotkey.get_code());
+        }
+    }
+    catch (...)
+    {
+    }
+
+    if (target && target != GetForegroundWindow())
+    {
+        SetForegroundWindow(target);
+    }
+    SendShortcut(win, ctrl, alt, shift, key);
+}
+
+static void HandleSideAction(SideAction action, HWND target)
+{
+    switch (action)
+    {
+    case SideAction::PreviousDesktop:
+    case SideAction::NextDesktop:
+        SendShortcut(true, true, false, false, action == SideAction::NextDesktop ? VK_RIGHT : VK_LEFT);
+        break;
+    case SideAction::PreviousZoneWindow:
+    case SideAction::NextZoneWindow:
+        CycleZoneWindow(IsWindow(target) ? target : nullptr, action == SideAction::NextZoneWindow);
+        break;
+    }
+}
+
+static void ReplaySideClick(WORD xbutton)
+{
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_XDOWN;
+    inputs[0].mi.mouseData = xbutton;
+    inputs[1] = inputs[0];
+    inputs[1].mi.dwFlags = MOUSEEVENTF_XUP;
+    SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+}
+
+// Returns true when the event belongs to a side-button chord; disposition says what to do with it.
+static bool HandleSideButtonEvent(WPARAM message, const MSLLHOOKSTRUCT& mouse, HookDisposition& disposition)
+{
+    disposition = HookDisposition::Swallow;
+
+    if (message == WM_RBUTTONUP && g_side.swallowRightUp)
+    {
+        g_side.swallowRightUp = false;
+        return true;
+    }
+
+    const WORD xbutton = HIWORD(mouse.mouseData);
+    if (message == WM_XBUTTONDOWN)
+    {
+        // The same button going down again means its up was lost: start over.
+        if (!g_settings.sideButtons || (g_side.held != SideButton::None && xbutton != g_side.xbutton) || IsSuppressedByGameMode())
+        {
+            return false;
+        }
+        const HWND window = ResolveTargetWindow(mouse.pt);
+        if (window && IsExcluded(window))
+        {
+            g_side = {};
+            return false;
+        }
+        g_side = {};
+        g_side.held = xbutton == XBUTTON1 ? SideButton::Back : SideButton::Forward;
+        g_side.xbutton = xbutton;
+        return true;
+    }
+
+    if (g_side.held == SideButton::None)
+    {
+        return false;
+    }
+
+    const bool back = g_side.held == SideButton::Back;
+    switch (message)
+    {
+    case WM_XBUTTONUP:
+    {
+        if (xbutton != g_side.xbutton)
+        {
+            return false;
+        }
+        const bool chorded = g_side.chorded;
+        g_side.held = SideButton::None;
+        g_side.wheelRemainder = 0;
+        if (!chorded)
+        {
+            ReplaySideClick(xbutton);
+        }
+        return true;
+    }
+
+    case WM_LBUTTONDOWN:
+    {
+        const ActionTarget target = ResolveActionTarget(mouse.pt, back ? InteractionAction::Move : InteractionAction::Resize);
+        if (target.eligibility != TargetEligibility::Eligible || !StartNativeHandoff(target.window, mouse.pt, back, true))
+        {
+            return false;
+        }
+        g_side.chorded = true;
+        return true;
+    }
+
+    case WM_RBUTTONDOWN:
+    {
+        const HWND window = ResolveTargetWindow(mouse.pt);
+        if (!window || IsExcluded(window))
+        {
+            return false;
+        }
+        const WPARAM command = !back ? SC_MINIMIZE : (IsZoomed(window) ? SC_RESTORE : SC_MAXIMIZE);
+        PostMessageW(window, WM_SYSCOMMAND, command, 0);
+        g_side.chorded = true;
+        g_side.swallowRightUp = true;
+        return true;
+    }
+
+    case WM_MOUSEWHEEL:
+    {
+        g_side.chorded = true;
+        g_side.wheelRemainder += static_cast<short>(xbutton);
+        const HWND window = ResolveTargetWindow(mouse.pt);
+        while (g_side.wheelRemainder >= WHEEL_DELTA || g_side.wheelRemainder <= -WHEEL_DELTA)
+        {
+            // Wheel up (positive) goes to the previous desktop or window.
+            const bool next = g_side.wheelRemainder < 0;
+            g_side.wheelRemainder += next ? WHEEL_DELTA : -WHEEL_DELTA;
+            const SideAction action = back ? (next ? SideAction::NextDesktop : SideAction::PreviousDesktop) :
+                                             (next ? SideAction::NextZoneWindow : SideAction::PreviousZoneWindow);
+            PostMessageW(g_hMsgWnd, WM_SIDE_ACTION, static_cast<WPARAM>(action), reinterpret_cast<LPARAM>(window));
+        }
+        return true;
+    }
+    }
+
+    return false;
+}
+
 static HookDisposition HandleActionButtonDown(MouseButton button, POINT point)
 {
     const InteractionAction action = ActionForButton(button);
@@ -2689,6 +3048,10 @@ static HookDisposition HandleActionButtonDown(MouseButton button, POINT point)
 
     if (g_modifierSession.disposition == ModifierHoldDisposition::Activated)
     {
+        if (action == InteractionAction::Move && g_settings.nativeDrag && StartNativeHandoff(target.window, point, true, false))
+        {
+            return HookDisposition::Swallow;
+        }
         return BeginInteraction(action, button, target.window, point) ? HookDisposition::Swallow : EnterModifierPassthrough(button, false);
     }
 
@@ -2730,6 +3093,15 @@ static HookDisposition HandleMouseEvent(WPARAM message, const MSLLHOOKSTRUCT& mo
     if (message == WM_MOUSEMOVE)
     {
         PERF_INCREMENT(mouseMoveCount);
+    }
+
+    if (message == WM_LBUTTONUP)
+    {
+        g_native.leftHeld = false;
+    }
+    if (HookDisposition sideDisposition; HandleSideButtonEvent(message, mouse, sideDisposition))
+    {
+        return sideDisposition;
     }
 
     const MouseButton upButton = ButtonFromUpMessage(message);
@@ -2785,6 +3157,13 @@ static HookDisposition HandleMouseEvent(WPARAM message, const MSLLHOOKSTRUCT& mo
         {
             const InteractionState pending = g_interaction;
             StopInteraction();
+            if (pending.action == InteractionAction::Move && g_settings.nativeDrag &&
+                StartNativeHandoff(pending.target, mouse.pt, true, false))
+            {
+                g_modifierSession.consumed = true;
+                g_modifierSession.disposition = ModifierHoldDisposition::Activated;
+                return HookDisposition::PassWithoutChaining;
+            }
             if (BeginInteraction(
                     pending.action,
                     pending.button,
@@ -3169,6 +3548,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ApplyPendingSettings();
         return 0;
 
+    case WM_TIMER:
+        if (wParam == NATIVE_START_TIMER_ID)
+        {
+            OnNativeStartTimeout();
+            return 0;
+        }
+        break;
+
+    case WM_SIDE_ACTION:
+        HandleSideAction(static_cast<SideAction>(wParam), reinterpret_cast<HWND>(lParam));
+        return 0;
+
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -3229,6 +3620,11 @@ static void CleanupRuntime()
     {
         UnhookWinEvent(g_hWinEventHook);
         g_hWinEventHook = nullptr;
+    }
+    if (g_hMoveSizeEventHook)
+    {
+        UnhookWinEvent(g_hMoveSizeEventHook);
+        g_hMoveSizeEventHook = nullptr;
     }
 
     if (g_interaction.phase != InteractionPhase::Idle)
@@ -3448,6 +3844,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     // Detect foreground switches to elevated processes (where key-up events stop arriving)
     g_hWinEventHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+    // Confirms that a native move/size handoff started
+    g_hMoveSizeEventHook = SetWinEventHook(
+        EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZESTART, nullptr, MoveSizeEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     if (!g_hhkKeyboard || !g_hhkMouse)
     {

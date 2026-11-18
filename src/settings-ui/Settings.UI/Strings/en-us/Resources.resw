@@ -6903,6 +6903,20 @@ Text uses the current drawing color.</value>
   <data name="GrabAndMove_UseAltResize.Description" xml:space="preserve">
     <value>Hold the modifier key and drag with the right mouse button from the nearest edge or corner to resize the window</value>
   </data>
+  <data name="GrabAndMove_NativeDrag.Header" xml:space="preserve">
+    <value>Hand off drags to Windows</value>
+    <comment>When enabled, a modifier key + drag starts the normal Windows window move, so FancyZones and Snap react to it</comment>
+  </data>
+  <data name="GrabAndMove_NativeDrag.Description" xml:space="preserve">
+    <value>The modifier key + drag starts a normal Windows move, as if you grabbed the title bar, so FancyZones zones and Snap work while dragging</value>
+  </data>
+  <data name="GrabAndMove_SideButtons.Header" xml:space="preserve">
+    <value>Mouse side-button chords</value>
+    <comment>Back and forward are the mouse side buttons</comment>
+  </data>
+  <data name="GrabAndMove_SideButtons.Description" xml:space="preserve">
+    <value>Hold back + drag to move, forward + drag to resize, back + scroll to switch desktops, forward + scroll to switch windows in a zone, back + right-click to maximize, forward + right-click to minimize. A plain click still goes back or forward</value>
+  </data>
   <data name="GrabAndMove_ExcludeApps.Header" xml:space="preserve">
     <value>Excluded apps</value>
   </data>
