@@ -66,6 +66,8 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 355
     env:
+      # Upstream's release builds skip C++ code analysis too (see Cpp.Build.props); it doubles the compile time.
+      SkipCppCodeAnalysis: 'true'
       TAG: ${{ needs.plan.outputs.tag }}
       HEAD_SHA: ${{ needs.plan.outputs.head }}
       VERSION: ${{ needs.plan.outputs.version }}
